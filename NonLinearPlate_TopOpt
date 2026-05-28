@@ -1,0 +1,289 @@
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import spsolve
+import scipy.spatial as spatial
+import time
+import matplotlib.pyplot as plt
+
+# Import Svanberg's MMA subproblem solver (assuming mma.py is in the same directory)
+from mma import mmasub 
+
+class NonlinearPlateTopOpt:
+    def __init__(self, nelx, nely, volfrac, penal, rmin, penalty_lambda, eps_fail):
+        self.nelx = nelx
+        self.nely = nely
+        self.volfrac = volfrac
+        self.penal = penal
+        self.rmin = rmin
+        
+        # Nonlinear penalty parameters
+        self.penalty_lambda = penalty_lambda
+        self.eps_fail = eps_fail
+        
+        # Material properties
+        self.Emin = 1e-9
+        self.Emax = 1.0  # Normalized for topology optimization
+        self.nu = 0.3
+        
+        # 5 DOFs per node: u, v, w, theta_x, theta_y
+        self.dofs_per_node = 5
+        self.nnodes = (nelx + 1) * (nely + 1)
+        self.ndof = self.dofs_per_node * self.nnodes
+        self.nelem = nelx * nely
+        
+        # Initialize design variables
+        self.x = volfrac * np.ones(self.nelem)
+        self.xPhys = self.x.copy()
+        
+        self.setup_mesh()
+        self.setup_filter()
+        self.setup_boundary_conditions()
+
+        # Allocate global vectors
+        self.U = np.zeros(self.ndof)          # Global displacement
+        self.Lambda = np.zeros(self.ndof)     # Adjoint vector
+        
+        # MMA cached variables
+        self.cached_obj = 0.0
+        self.cached_vol = 0.0
+        self.cached_dobj = np.zeros(self.nelem)
+        self.cached_dvol = np.zeros(self.nelem)
+
+    def setup_mesh(self):
+        """Creates the DOF connectivity matrix (edofMat) for 5-DOF nodes."""
+        ely, elx = np.meshgrid(np.arange(self.nely), np.arange(self.nelx))
+        ely, elx = ely.flatten(), elx.flatten()
+        
+        n1 = (self.nely + 1) * elx + ely
+        n2 = (self.nely + 1) * (elx + 1) + ely
+        
+        # 4 nodes per element, 5 DOFs per node = 20 DOFs per element
+        self.edofMat = np.zeros((self.nelem, 20), dtype=int)
+        for i in range(self.nelem):
+            nodes = [n1[i], n2[i], n2[i]+1, n1[i]+1]
+            for j, n in enumerate(nodes):
+                self.edofMat[i, j*5:(j+1)*5] = np.arange(n*5, n*5+5)
+                
+        self.iK = np.kron(self.edofMat, np.ones((20, 1))).flatten()
+        self.jK = np.kron(self.edofMat, np.ones((1, 20))).flatten()
+
+    def setup_filter(self):
+        """Standard density filter setup using cKDTree."""
+        y_coord, x_coord = np.meshgrid(np.arange(self.nely), np.arange(self.nelx))
+        coords = np.column_stack((x_coord.flatten(), y_coord.flatten()))
+        tree = spatial.cKDTree(coords)
+        sparse_dist = tree.sparse_distance_matrix(tree, self.rmin, output_type='coo_matrix')
+        
+        self.H = sp.coo_matrix((np.maximum(0.0, self.rmin - sparse_dist.data), 
+                               (sparse_dist.row, sparse_dist.col))).tocsc()
+        self.Hs = self.H.sum(1).A1
+
+    def setup_boundary_conditions(self):
+        """Define supports and loads."""
+        # Example: Clamped left edge, point load downward (w-direction) on right edge center
+        left_nodes = np.arange(0, self.nely + 1)
+        top_nodes = np.arange(self.nely, (self.nelx + 1) * (self.nely + 1), self.nely + 1)
+        
+        # Clamp all 5 DOFs on the left boundary
+        self.fixed_dofs = np.array([n * 5 + d for n in left_nodes for d in range(5)])
+        self.free_dofs = np.setdiff1d(np.arange(self.ndof), self.fixed_dofs)
+        
+        # External load vector (Out-of-plane loading)
+        self.F_ext = np.zeros(self.ndof)
+        center_right_node = (self.nelx) * (self.nely + 1) + self.nely // 2
+        load_dof = center_right_node * 5 + 2  # +2 corresponds to the 'w' DOF
+        self.F_ext[load_dof] = -1.0
+        
+        # Target displacement vector L (We want to maximize displacement at the load point)
+        self.L = np.zeros(self.ndof)
+        self.L[load_dof] = 1.0
+
+    def get_element_mechanics(self, u_e, x_phys_e):
+        """
+        TODO: SYMBOLIC DERIVATION REQUIRED HERE.
+        Evaluates the local nonlinear internal force, tangent stiffness, and von Karman strain.
+        """
+        # Interpolate stiffness
+        E_val = self.Emin + (x_phys_e ** self.penal) * (self.Emax - self.Emin)
+        
+        # 1. Calculate nonlinear strains (von Karman) at integration points based on u_e
+        eps_vk = 0.0 # Placeholder for maximum principal strain in the element
+        
+        # 2. Calculate local internal force vector (20x1)
+        f_int_e = np.zeros(20) # Placeholder
+        
+        # 3. Calculate local tangent stiffness matrix (20x20)
+        # K_T = K_linear + K_initial_stress(u_e) + K_initial_disp(u_e)
+        k_t_e = np.eye(20) * E_val # Placeholder: strictly linear dummy behavior
+        
+        # 4. Derivative of strain wrt displacements (for adjoint rhs)
+        deps_du = np.zeros(20) # Placeholder
+        
+        return f_int_e, k_t_e, eps_vk, deps_du
+
+    def evaluate(self, x_current):
+        """Main FEA Newton-Raphson solver and Adjoint sensitivity analysis."""
+        # 1. Filter and Heaviside Projection
+        x_tilde = self.H.dot(x_current) / self.Hs
+        
+        beta, eta = 8.0, 0.5
+        denom = np.tanh(beta * eta) + np.tanh(beta * (1.0 - eta))
+        self.xPhys = (np.tanh(beta * eta) + np.tanh(beta * (x_tilde - eta))) / denom
+        dxPhys_dxtilde = beta * (1.0 - np.tanh(beta * (x_tilde - eta))**2) / denom
+
+        # 2. Newton-Raphson Solver Loop
+        nr_tol = 1e-5
+        max_iter = 15
+        
+        for nr_iter in range(max_iter):
+            F_int = np.zeros(self.ndof)
+            sK = np.zeros(self.nelem * 400)
+            
+            # Strain penalty state
+            eps_max_array = np.zeros(self.nelem)
+            deps_dU_global = np.zeros((self.nelem, 20))
+            
+            # Assemble Global Tangent Stiffness and Internal Forces
+            for e in range(self.nelem):
+                edofs = self.edofMat[e]
+                u_e = self.U[edofs]
+                
+                # Retrieve nonlinear element mechanics (The computationally heavy part)
+                f_int_e, k_t_e, eps_vk, deps_du = self.get_element_mechanics(u_e, self.xPhys[e])
+                
+                F_int[edofs] += f_int_e
+                sK[e*400 : (e+1)*400] = k_t_e.flatten()
+                
+                eps_max_array[e] = eps_vk
+                deps_dU_global[e] = deps_du
+
+            # Global Tangent Stiffness Matrix
+            K_T = sp.coo_matrix((sK, (self.iK, self.jK)), shape=(self.ndof, self.ndof)).tocsc()
+            
+            # Calculate Residual
+            R = self.F_ext - F_int
+            
+            # Check convergence on free DOFs
+            res_norm = np.linalg.norm(R[self.free_dofs])
+            if res_norm < nr_tol:
+                break
+                
+            # Solve for displacement increment
+            K_T_free = K_T[self.free_dofs, :][:, self.free_dofs]
+            delta_U = spsolve(K_T_free, R[self.free_dofs])
+            self.U[self.free_dofs] += delta_U
+            
+            if nr_iter == max_iter - 1:
+                print("Warning: Newton-Raphson did not converge!")
+
+        # 3. Objective Function Evaluation
+        # Obj = - L^T * U + Lambda * sum( max(0, eps - eps_fail)^2 )
+        disp_obj = -np.dot(self.L, self.U)
+        
+        penalty_violation = np.maximum(0, eps_max_array - self.eps_fail)
+        penalty_obj = self.penalty_lambda * np.sum(penalty_violation**2) # Assuming unit volume
+        self.cached_obj = disp_obj + penalty_obj
+        
+        # 4. Adjoint Sensitivity Analysis
+        # rhs = - d(Obj) / dU
+        df0_dU = -self.L.copy()
+        for e in range(self.nelem):
+            if penalty_violation[e] > 0:
+                # Add derivative of the penalty term
+                edofs = self.edofMat[e]
+                df0_dU[edofs] += 2 * self.penalty_lambda * penalty_violation[e] * deps_dU_global[e]
+        
+        # Solve Adjoint System: K_T^T * Lambda = -df0_dU
+        # Note: K_T is symmetric, so K_T^T = K_T
+        self.Lambda[self.free_dofs] = spsolve(K_T_free, -df0_dU[self.free_dofs])
+        
+        # 5. Extract Element Sensitivities
+        dobj_dphys = np.zeros(self.nelem)
+        for e in range(self.nelem):
+            edofs = self.edofMat[e]
+            # Chain rule: Lambda^T * d(F_int)/dx_e
+            # In SIMP, F_int is roughly proportional to x^p, so dF/dx = p * x^(p-1) * F_int_0
+            # You must implement the exact analytical derivative of F_int wrt density here
+            dF_int_dx = np.zeros(20) # TODO: Implement exact d(F_int)/dx
+            dobj_dphys[e] = np.dot(self.Lambda[edofs], dF_int_dx)
+            
+        # 6. Apply Filter Chain Rule (Backpropagation)
+        dobj_proj = dobj_dphys * dxPhys_dxtilde
+        self.cached_dobj = self.H.dot(dobj_proj / self.Hs)
+        
+        # Volume constraints and sensitivities
+        self.cached_vol = np.mean(self.xPhys) - self.volfrac
+        dvol_dphys = np.ones(self.nelem) / self.nelem
+        self.cached_dvol = self.H.dot(dvol_dphys * dxPhys_dxtilde / self.Hs)
+
+def main(SAVE_DESIGN):
+    # Parameters
+    nelx, nely = 30, 30
+    volfrac = 0.3
+    penal = 3.0
+    rmin = 2.0
+    penalty_lambda = 1e4
+    eps_fail = 0.05  # 5% strain failure limit
+    
+    plate = NonlinearPlateTopOpt(nelx, nely, volfrac, penal, rmin, penalty_lambda, eps_fail)
+    
+    # MMA Initialization
+    x = plate.x.copy()
+    xold1, xold2 = x.copy(), x.copy()
+    low, upp = np.zeros(plate.nelem), np.ones(plate.nelem)
+    
+    m_mma = 1
+    a0mma = 1.0
+    amma = np.zeros((m_mma, 1))
+    cmma = 1000.0 * np.ones((m_mma, 1))
+    dmma = np.zeros((m_mma, 1))
+    
+    loop, change = 0, 1.0
+    
+    print(f"{'It':<4} | {'Obj':<12} | {'Vol':<5} | {'Change':<5}")
+    print("-" * 40)
+    
+    while change > 0.01 and loop < 200:
+        loop += 1
+        
+        # Evaluate Nonlinear Mechanics & Sensitivities
+        plate.evaluate(x)
+        
+        # Format for MMA
+        f0val = plate.cached_obj
+        df0dx = plate.cached_dobj[:, np.newaxis]
+        fval  = np.array([[plate.cached_vol]])
+        dfdx  = plate.cached_dvol[:, np.newaxis].T
+        
+        # Run Svanberg MMA Subproblem
+        xnew, _, _, _, _, _, _, _, _, low, upp = mmasub(
+            m_mma, plate.nelem, loop,
+            x[:, np.newaxis], np.zeros((plate.nelem, 1)), np.ones((plate.nelem, 1)),
+            xold1[:, np.newaxis], xold2[:, np.newaxis],
+            f0val, df0dx, fval, dfdx,
+            low, upp, a0mma, amma, cmma, dmma
+        )
+        
+        xold2[:] = xold1
+        xold1[:] = x
+        x[:] = xnew[:, 0]
+        
+        change = np.linalg.norm(x - xold1, np.inf)
+        print(f"{loop:<4} | {f0val:<12.5f} | {plate.cached_vol+volfrac:<5.3f} | {change:<5.3f}")
+    print("Optimization complete. Design saved to optimized_design.npy")
+
+    Resulting_npy = x.reshape((nely, nelx))
+
+    # Plotting the final design
+    plt.imshow(Resulting_npy, cmap='gray', origin='lower')
+    plt.title('Optimized Design')
+    plt.colorbar(label='Density')
+    if SAVE_DESIGN:
+        plt.savefig("optimized_design.png", dpi=300)
+        np.save("optimized_design.npy", Resulting_npy)
+    plt.show()
+
+    
+
+if __name__ == "__main__":
+    main(SAVE_DESIGN=True)
